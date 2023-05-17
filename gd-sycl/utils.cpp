@@ -72,7 +72,7 @@ void get_CRSM_from_svm(Classification_Data_CRS &M, const std::string &file_path)
     //Step 1):
     auto norm_sqrd = 0.0;
     for(auto j = M.row_ptr[i]; j < M.row_ptr[i+1]; j++){
-      assert(j < M.values.size());
+      assert(j < static_cast<int>(M.values.size()));
       norm_sqrd += std::pow(M.values[j], 2);
     }
     auto norm = std::sqrt(norm_sqrd);

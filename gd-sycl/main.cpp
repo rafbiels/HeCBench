@@ -2,18 +2,26 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include "common.h"
+#include <sycl/sycl.hpp>
 #include "utils.h"
 
 int main(int argc, const char *argv[]) {
-  if (argc != 5) {
+  std::string file_path{"gisette_scale"};
+  float lambda{0.0001f};
+  float alpha{10.0f};
+  int iters{100};
+  if (argc >= 5) {
+    file_path = argv[1]; 
+    lambda = atof(argv[2]);
+    alpha = atof(argv[3]);
+    iters = atof(argv[4]);
+  } else if (argc == 2) {
+    iters = atof(argv[1]);
+  } else if (argc > 2) {
     printf("Usage: %s <path to file> <lambda> <alpha> <repeat>\n", argv[0]);
+    printf("   or: %s <repeat>\n", argv[0]);
     return 1;
   }
-  const std::string file_path = argv[1]; 
-  const float lambda = atof(argv[2]);
-  const float alpha = atof(argv[3]);
-  const int iters = atof(argv[4]);
 
   //store the problem data in variable A and the data is going to be normalized
   Classification_Data_CRS A;
@@ -25,36 +33,23 @@ int main(int argc, const char *argv[]) {
   std::vector<float> x(n, 0.f);
   std::vector<float> grad (n);
 
-#ifdef USE_GPU
-  gpu_selector dev_sel;
-#else
-  cpu_selector dev_sel;
-#endif
-  queue q(dev_sel, property::queue::in_order());
+  sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order());
 
-  buffer<float, 1> d_x(x.data(), n);
+  sycl::buffer<float, 1> d_x(x.data(), n);
+  sycl::buffer<float, 1> d_grad(n);
+  sycl::buffer<float, 1> d_total_obj_val(1);
+  sycl::buffer<float, 1> d_l2_norm(1);
+  sycl::buffer<int, 1> d_correct(1);
+  sycl::buffer<int, 1> d_row_ptr(A.row_ptr.data(), A.row_ptr.size());
+  sycl::buffer<int, 1> d_col_index(A.col_index.data(), A.col_index.size());
+  sycl::buffer<float, 1> d_value(A.values.data(), A.values.size());
+  sycl::buffer<int, 1> d_y_label(A.y_label.data(), A.y_label.size());
 
-  buffer<float, 1> d_grad(n);
+  sycl::range<1> gws((m+255)/256*256);
+  sycl::range<1> lws (256);
 
-  buffer<float, 1> d_total_obj_val(1);
-
-  buffer<float, 1> d_l2_norm(1);
-
-  buffer<int, 1> d_correct(1);
-
-  buffer<int, 1> d_row_ptr(A.row_ptr.data(), A.row_ptr.size());
-
-  buffer<int, 1> d_col_index(A.col_index.data(), A.col_index.size());
-
-  buffer<float, 1> d_value(A.values.data(), A.values.size());
-
-  buffer<int, 1> d_y_label(A.y_label.data(), A.y_label.size());
-
-  range<1> gws((m+255)/256*256);
-  range<1> lws (256);
-
-  range<1> gws2((n+255)/256*256);
-  range<1> lws2 (256);
+  sycl::range<1> gws2((n+255)/256*256);
+  sycl::range<1> lws2 (256);
 
   float obj_val = 0.f;
   float train_error = 0.f;
@@ -69,40 +64,40 @@ int main(int argc, const char *argv[]) {
     float l2_norm = 0.f;
     int correct = 0;
 
-    q.submit([&] (handler &cgh) {
-      auto acc = d_total_obj_val.get_access<sycl_discard_write>(cgh);
+    q.submit([&] (sycl::handler &cgh) {
+      auto acc = d_total_obj_val.get_access<sycl::access::mode::discard_write>(cgh);
       cgh.copy(&total_obj_val, acc);
     });
 
-    q.submit([&] (handler &cgh) {
-      auto acc = d_l2_norm.get_access<sycl_discard_write>(cgh);
+    q.submit([&] (sycl::handler &cgh) {
+      auto acc = d_l2_norm.get_access<sycl::access::mode::discard_write>(cgh);
       cgh.copy(&l2_norm, acc);
     });
 
-    q.submit([&] (handler &cgh) {
-      auto acc = d_correct.get_access<sycl_discard_write>(cgh);
+    q.submit([&] (sycl::handler &cgh) {
+      auto acc = d_correct.get_access<sycl::access::mode::discard_write>(cgh);
       cgh.copy(&correct, acc);
     });
 
     //reset gradient vector
     std::fill(grad.begin(), grad.end(), 0.f);
 
-    q.submit([&] (handler &cgh) {
-      auto acc = d_grad.get_access<sycl_discard_write>(cgh);
+    q.submit([&] (sycl::handler &cgh) {
+      auto acc = d_grad.get_access<sycl::access::mode::discard_write>(cgh);
       cgh.copy(grad.data(), acc);
     });
     
     // compute the total objective, correct rate, and gradient
-    q.submit([&] (handler &cgh) {
-      auto x = d_x.get_access<sycl_read>(cgh);
-      auto grad = d_grad.get_access<sycl_read_write>(cgh);
-      auto A_row_ptr = d_row_ptr.get_access<sycl_read>(cgh);
-      auto A_col_index = d_col_index.get_access<sycl_read>(cgh);
-      auto A_value = d_value.get_access<sycl_read>(cgh);
-      auto A_y_label = d_y_label.get_access<sycl_read>(cgh);
-      auto total_obj_val = d_total_obj_val.get_access<sycl_read_write>(cgh);
-      auto correct = d_correct.get_access<sycl_read_write>(cgh);
-      cgh.parallel_for<class compute>(nd_range<1>(gws, lws), [=] (nd_item<1> item) {
+    q.submit([&] (sycl::handler &cgh) {
+      auto x = d_x.get_access<sycl::access::mode::read>(cgh);
+      auto grad = d_grad.get_access<sycl::access::mode::read_write>(cgh);
+      auto A_row_ptr = d_row_ptr.get_access<sycl::access::mode::read>(cgh);
+      auto A_col_index = d_col_index.get_access<sycl::access::mode::read>(cgh);
+      auto A_value = d_value.get_access<sycl::access::mode::read>(cgh);
+      auto A_y_label = d_y_label.get_access<sycl::access::mode::read>(cgh);
+      auto total_obj_val = d_total_obj_val.get_access<sycl::access::mode::read_write>(cgh);
+      auto correct = d_correct.get_access<sycl::access::mode::read_write>(cgh);
+      cgh.parallel_for<class compute>(sycl::nd_range<1>(gws, lws), [=] (sycl::nd_item<1> item) {
         int i = item.get_global_id(0);
         if (i < m) {
           // Simple sparse matrix multiply x' = A * x
@@ -113,18 +108,18 @@ int main(int argc, const char *argv[]) {
 
           // compute objective 
           float v = sycl::log(1+sycl::exp(-1*A_y_label[i]*xp));
-          auto atomic_obj_ref = atomic_ref<float,
-            memory_order::relaxed, memory_scope::device,
-            access::address_space::global_space> (total_obj_val[0]);
+          auto atomic_obj_ref = sycl::atomic_ref<float,
+            sycl::memory_order::relaxed, sycl::memory_scope::device,
+            sycl::access::address_space::global_space> (total_obj_val[0]);
           atomic_obj_ref.fetch_add(v);
 
           // compute errors
           float prediction = 1.f/(1.f + sycl::exp(-xp));
           int t = (prediction >= 0.5f) ? 1 : -1;
           if (A_y_label[i] == t) {
-            auto atomic_correct_ref = atomic_ref<int,
-              memory_order::relaxed, memory_scope::device,
-              access::address_space::global_space> (correct[0]);
+            auto atomic_correct_ref = sycl::atomic_ref<int,
+              sycl::memory_order::relaxed, sycl::memory_scope::device,
+              sycl::access::address_space::global_space> (correct[0]);
             atomic_correct_ref.fetch_add(1);
 	  }
 
@@ -133,9 +128,9 @@ int main(int argc, const char *argv[]) {
           accum = accum / (1.f + accum);
           for(int j = A_row_ptr[i]; j < A_row_ptr[i+1]; ++j){
             float temp = -accum*A_value[j]*A_y_label[i];
-            auto atomic_grad_ref = atomic_ref<float,
-              memory_order::relaxed, memory_scope::device,
-              access::address_space::global_space> (grad[A_col_index[j]]);
+            auto atomic_grad_ref = sycl::atomic_ref<float,
+              sycl::memory_order::relaxed, sycl::memory_scope::device,
+              sycl::access::address_space::global_space> (grad[A_col_index[j]]);
             atomic_grad_ref.fetch_add(temp);
           }
         }
@@ -143,32 +138,32 @@ int main(int argc, const char *argv[]) {
     }); 
 
     // display training status for verification
-    q.submit([&] (handler &cgh) {
-      auto x = d_x.get_access<sycl_read>(cgh);
-      auto l2_norm = d_l2_norm.get_access<sycl_read_write>(cgh);
-      cgh.parallel_for<class norm>(nd_range<1>(gws2, lws2), [=] (nd_item<1> item) {
+    q.submit([&] (sycl::handler &cgh) {
+      auto x = d_x.get_access<sycl::access::mode::read>(cgh);
+      auto l2_norm = d_l2_norm.get_access<sycl::access::mode::read_write>(cgh);
+      cgh.parallel_for<class norm>(sycl::nd_range<1>(gws2, lws2), [=] (sycl::nd_item<1> item) {
         int i = item.get_global_id(0);
         if (i < n) {
-          auto atomic_l2norm_ref = atomic_ref<float,
-            memory_order::relaxed, memory_scope::device,
-            access::address_space::global_space> (l2_norm[0]);
+          auto atomic_l2norm_ref = sycl::atomic_ref<float,
+            sycl::memory_order::relaxed, sycl::memory_scope::device,
+            sycl::access::address_space::global_space> (l2_norm[0]);
           atomic_l2norm_ref.fetch_add(x[i]*x[i]);
         }
       });
     });
 
-    q.submit([&] (handler &cgh) {
-      auto acc = d_total_obj_val.get_access<sycl_read>(cgh);
+    q.submit([&] (sycl::handler &cgh) {
+      auto acc = d_total_obj_val.get_access<sycl::access::mode::read>(cgh);
       cgh.copy(acc, &total_obj_val);
     });
 
-    q.submit([&] (handler &cgh) {
-      auto acc = d_l2_norm.get_access<sycl_read>(cgh);
+    q.submit([&] (sycl::handler &cgh) {
+      auto acc = d_l2_norm.get_access<sycl::access::mode::read>(cgh);
       cgh.copy(acc, &l2_norm);
     });
 
-    q.submit([&] (handler &cgh) {
-      auto acc = d_correct.get_access<sycl_read>(cgh);
+    q.submit([&] (sycl::handler &cgh) {
+      auto acc = d_correct.get_access<sycl::access::mode::read>(cgh);
       cgh.copy(acc, &correct);
     });
     
@@ -178,10 +173,10 @@ int main(int argc, const char *argv[]) {
     train_error = 1.f-(correct/(float)m); 
 
     // update x (gradient does not need to be updated)
-    q.submit([&] (handler &cgh) {
-      auto x = d_x.get_access<sycl_read_write>(cgh);
-      auto grad = d_grad.get_access<sycl_read>(cgh);
-      cgh.parallel_for<class update>(nd_range<1>(gws2, lws2), [=] (nd_item<1> item) {
+    q.submit([&] (sycl::handler &cgh) {
+      auto x = d_x.get_access<sycl::access::mode::read_write>(cgh);
+      auto grad = d_grad.get_access<sycl::access::mode::read>(cgh);
+      cgh.parallel_for<class update>(sycl::nd_range<1>(gws2, lws2), [=] (sycl::nd_item<1> item) {
         int i = item.get_global_id(0);
         if (i < n) {
           float g = grad[i] / (float)m + lambda * x[i]; 
