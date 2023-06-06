@@ -5,16 +5,15 @@
 // =============================================================
 
 #include "GSimulation.hpp"
-#include "common.h"
 
 /* Default Constructor for the GSimulation class which sets up the default
  * values for number of particles, number of integration steps, time steo and
  * sample frequency */
 GSimulation::GSimulation() {
-  std::cout << "==============================="
+  std::cout << "=================================================="
             << "\n";
-  std::cout << " Initialize Gravity Simulation"
-            << "\n";
+  std::cout << " Initialising the gravity simulation"
+            << "\n\n";
   set_npart(16000);
   set_nsteps(10);
   set_tstep(0.1);
@@ -76,8 +75,14 @@ void GSimulation::InitMass() {
 
 /* This function does the simulation logic for Nbody */
 void GSimulation::Start() {
-  RealType dt = get_tstep();
   int n = get_npart();
+  int nsteps = get_nsteps();
+  RealType dt = get_tstep();
+
+  std::cout << "# N Particles         : " << n << "\n";
+  std::cout << "# N Steps             : " << nsteps << "\n";
+  std::cout << "# Step time           : " << dt << "\n";
+
   std::vector<RealType> energy(n, 0.f);
   // allocate particles
   particles_.resize(n);
@@ -86,10 +91,6 @@ void GSimulation::Start() {
   InitVel();
   InitAcc();
   InitMass();
-
-#ifdef DEBUG
-  PrintHeader();
-#endif
 
   total_time_ = 0.;
 
@@ -100,33 +101,29 @@ void GSimulation::Start() {
   int nf = 0;
   double av = 0.0, dev = 0.0;
 
-  // Create a queue to the selected device and enabled asynchronous exception
-  // handling for that queue
-#ifdef USE_GPU 
-  gpu_selector dev_sel;
-#else
-  cpu_selector dev_sel;
-#endif
-  queue q(dev_sel, property::queue::in_order());
+  std::cout << "==================================================";
+  std::cout << "\n Running the simulation\n";
 
-  range<1> gws ((n+255)/256 * 256);
-  range<1> lws (256);
+  // Create a queue
+  sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order{});
 
-  Particle *p = malloc_device<Particle>(n, q);
+  sycl::range<1> gws ((n+255)/256 * 256);
+  sycl::range<1> lws (256);
+
+  Particle *p = sycl::malloc_device<Particle>(n, q);
   q.memcpy(p, particles_.data(), n * sizeof(Particle)).wait();
 
-  RealType *e = malloc_device<RealType>(n, q);
+  RealType *e = sycl::malloc_device<RealType>(n, q);
 
   TimeInterval t0;
-  int nsteps = get_nsteps();
   // Looping across integration steps
   for (int s = 1; s <= nsteps; ++s) {
     TimeInterval ts0;
 
     // Submitting first kernel to device which computes acceleration of all
     // particles
-    q.submit([&](handler& h) {
-      h.parallel_for<class compute_acceleration>(nd_range<1>(gws, lws), [=](nd_item<1> item) {
+    q.submit([&](sycl::handler& h) {
+      h.parallel_for<class compute_acceleration>(sycl::nd_range<1>(gws, lws), [=](sycl::nd_item<1> item) {
         int i = item.get_global_id(0);
         if (i >= n) return;
 
@@ -159,8 +156,8 @@ void GSimulation::Start() {
       });
     });
     // Second kernel updates the velocity and position for all particles
-    q.submit([&](handler& h) {
-      h.parallel_for<class update_velocity_position>(nd_range<1>(gws, lws), [=](nd_item<1> item) {
+    q.submit([&](sycl::handler& h) {
+      h.parallel_for<class update_velocity_position>(sycl::nd_range<1>(gws, lws), [=](sycl::nd_item<1> item) {
         auto i = item.get_global_id(0);
         if (i >= n) return;
 
@@ -188,7 +185,7 @@ void GSimulation::Start() {
     /* Third kernel accumulates the energy of this Nbody system
      * Reduction operation can be done using reducer interface in SYCL 2020
      */
-    q.submit([&](handler& h) {
+    q.submit([&](sycl::handler& h) {
       h.single_task<class accumulate_energy>([=]() {
         for (int i = 1; i < n; i++) e[0] += e[i];
       });
@@ -202,15 +199,6 @@ void GSimulation::Start() {
     kenergy_ = 0.5 * energy[0];
     if ((s % get_sfreq()) == 0) {
       nf += 1;
-#ifdef DEBUG
-      std::cout << " " << std::left << std::setw(8) << s << std::left
-                << std::setprecision(5) << std::setw(8) << s * get_tstep()
-                << std::left << std::setprecision(5) << std::setw(12)
-                << kenergy_ << std::left << std::setprecision(5)
-                << std::setw(12) << elapsed_seconds << std::left
-                << std::setprecision(5) << std::setw(12)
-                << gflops * get_sfreq() / elapsed_seconds << "\n";
-#endif
       if (nf > 2) {
         av += gflops * get_sfreq() / elapsed_seconds;
         dev += gflops * get_sfreq() * gflops * get_sfreq() /
@@ -228,28 +216,9 @@ void GSimulation::Start() {
   std::cout << "# Total Energy        : " << kenergy_ << "\n";
   std::cout << "# Total Time (s)      : " << total_time_ << "\n";
   std::cout << "# Average Performance : " << av << " +- " << dev << "\n";
-  std::cout << "===============================";
+  std::cout << "==================================================";
   std::cout << "\n";
 
   free(p, q);
   free(e, q);
 }
-
-#ifdef DEBUG
-/* Print the headers for the output */
-void GSimulation::PrintHeader() {
-  std::cout << " nPart = " << get_npart() << "; "
-            << "nSteps = " << get_nsteps() << "; "
-            << "dt = " << get_tstep() << "\n";
-
-  std::cout << "------------------------------------------------"
-            << "\n";
-  std::cout << " " << std::left << std::setw(8) << "s" << std::left
-            << std::setw(8) << "dt" << std::left << std::setw(12) << "kenergy"
-            << std::left << std::setw(12) << "time (s)" << std::left
-            << std::setw(12) << "GFLOPS"
-            << "\n";
-  std::cout << "------------------------------------------------"
-            << "\n";
-}
-#endif
