@@ -215,7 +215,7 @@ void GSimulation::Start() {
   std::cout << "\n";
   std::cout << "# Total Energy        : " << kenergy_ << "\n";
   std::cout << "# Total Time (s)      : " << total_time_ << "\n";
-  std::cout << "# Average Performance : " << av << " +- " << dev << "\n";
+  // std::cout << "# Average Performance : " << av << " +- " << dev << "\n";
   std::cout << "==================================================";
   std::cout << "\n";
 
